@@ -41,13 +41,31 @@ jobs:
       - uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          retries: 3
           script: |
             const { execFileSync } = require('node:child_process');
             const pull_number = context.payload.pull_request.number;
             const author = context.payload.pull_request.user.login;
             const { owner, repo } = context.repo;
 
-            const { data: pull } = await github.rest.pulls.get({ owner, repo, pull_number });
+            async function apiOrSkip(description, operation) {
+              try {
+                return await operation();
+              } catch (error) {
+                const status = error.status ?? error.response?.status;
+                const transient = status === 429 || (status >= 500 && status < 600);
+                if (!transient) throw error;
+                core.warning(`${description} skipped after GitHub API returned ${status}.`);
+                return undefined;
+              }
+            }
+
+            const pullResponse = await apiOrSkip(
+              'Reviewer suggestions',
+              () => github.rest.pulls.get({ owner, repo, pull_number }),
+            );
+            if (!pullResponse) return;
+            const { data: pull } = pullResponse;
 
             try {
               execFileSync('git', ['fetch', 'origin', pull.base.ref], { encoding: 'utf8' });
@@ -55,9 +73,13 @@ jobs:
               core.warning(`git fetch for base ref ${pull.base.ref} failed: ${e.message}`);
             }
 
-            const files = await github.paginate(github.rest.pulls.listFiles, {
-              owner, repo, pull_number, per_page: 100,
-            });
+            const files = await apiOrSkip(
+              'Changed-file lookup',
+              () => github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number, per_page: 100,
+              }),
+            );
+            if (!files) return;
 
             // Parse `git blame -p` output to find the most-recent commit per file.
             function latestBlameCommit(blameOutput) {
@@ -125,7 +147,13 @@ jobs:
               try {
                 await github.rest.repos.checkCollaborator({ owner, repo, username: login });
                 isCollaborator = true;
-              } catch (_) { /* not a collaborator */ }
+              } catch (error) {
+                const status = error.status ?? error.response?.status;
+                if (status !== 404) {
+                  core.warning(`Collaborator lookup for ${login} failed with ${status ?? 'unknown status'}.`);
+                  continue;
+                }
+              }
 
               if (isCollaborator) {
                 committerCounts.set(login, (committerCounts.get(login) ?? 0) + 1);
@@ -167,15 +195,25 @@ jobs:
             }
 
             // Update existing suggestion comment rather than posting a new one.
-            const allComments = await github.paginate(github.rest.issues.listComments, {
-              owner, repo, issue_number: pull_number, per_page: 100,
-            });
+            const allComments = await apiOrSkip(
+              'Reviewer suggestion comment lookup',
+              () => github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: pull_number, per_page: 100,
+              }),
+            );
+            if (!allComments) return;
             const existing = allComments.find(c => c.body?.includes(MARKER));
 
             if (existing) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-              core.info(`Updated reviewer suggestion comment on #${pull_number}`);
+              const updated = await apiOrSkip(
+                'Reviewer suggestion comment update',
+                () => github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body }),
+              );
+              if (updated) core.info(`Updated reviewer suggestion comment on #${pull_number}`);
             } else {
-              await github.rest.issues.createComment({ owner, repo, issue_number: pull_number, body });
-              core.info(`Posted reviewer suggestion comment on #${pull_number}`);
+              const created = await apiOrSkip(
+                'Reviewer suggestion comment creation',
+                () => github.rest.issues.createComment({ owner, repo, issue_number: pull_number, body }),
+              );
+              if (created) core.info(`Posted reviewer suggestion comment on #${pull_number}`);
             }

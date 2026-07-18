@@ -78,18 +78,27 @@ jobs:
             const ref = context.payload.pull_request.head.sha;
             const maxAttempts = 30;
             for (let i = 0; i < maxAttempts; i++) {
-              const { data } = await github.rest.checks.listForRef({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                ref,
-                check_name: "labeler",
-              });
-              const check = data.check_runs[0];
-              if (check && check.status === "completed") {
-                core.info(`labeler ${check.conclusion}`);
-                return;
+              try {
+                const { data } = await github.rest.checks.listForRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref,
+                  check_name: "labeler",
+                });
+                const check = data.check_runs[0];
+                if (check && check.status === "completed") {
+                  core.info(`labeler ${check.conclusion}`);
+                  return;
+                }
+                core.info(`labeler not ready (attempt ${i + 1}/${maxAttempts})`);
+              } catch (error) {
+                const status = error.status ?? error.response?.status;
+                const transient = status === 429 || (status >= 500 && status < 600);
+                if (!transient) throw error;
+                core.warning(
+                  `labeler lookup returned ${status} (attempt ${i + 1}/${maxAttempts}); retrying`
+                );
               }
-              core.info(`labeler not ready (attempt ${i + 1}/${maxAttempts})`);
               await new Promise((r) => setTimeout(r, 10000));
             }
             core.warning("labeler did not complete within 5 minutes; proceeding with current labels.");
@@ -98,6 +107,7 @@ jobs:
         id: decide
         uses: actions/github-script@v9
         with:
+          retries: 3
           script: |
             const eventName = context.eventName;
             let labels = [];
@@ -232,6 +242,7 @@ jobs:
       - name: Cancel obsolete backport check_runs for the removed target
         uses: actions/github-script@v9
         with:
+          retries: 3
           script: |
             const { owner, repo } = context.repo;
             const target = context.payload.label.name;
